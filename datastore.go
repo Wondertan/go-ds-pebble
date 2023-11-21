@@ -2,6 +2,7 @@ package pebbleds
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -9,7 +10,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
-	log "github.com/ipfs/go-log/v2"
+	"github.com/ipfs/go-log/v2"
 	"github.com/jbenet/goprocess"
 )
 
@@ -76,35 +77,23 @@ func NewDatastore(path string, opts *pebble.Options) (*Datastore, error) {
 	return store, nil
 }
 
-// get performs a get on the database, copying the value to a new slice and
-// returning it if retval is true. If retval is false, no copy will be
-// performed, and the returned value will always be nil, whether or not the key
-// exists. If the key doesn't exist, ds.ErrNotFound will be returned. When no
-// error occurs, the size of the value is also returned.
-func (d *Datastore) get(key []byte, retval bool) ([]byte, int, error) {
-	// We do not use db.Get because it bypasses bloom filters, resulting
-	// in more reads that needed, particularly for non existing keys.
-	// https://github.com/cockroachdb/pebble/issues/197
-	iter := d.db.NewIter(nil)
-	defer iter.Close()
-	ok := iter.SeekPrefixGE(key)
-	if !ok {
-		return nil, 0, ds.ErrNotFound
+// get performs a get on the database, If the key doesn't exist,
+// ds.ErrNotFound will be returned.
+func (d *Datastore) get(key []byte) ([]byte, error) {
+	val, closer, err := d.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, ds.ErrNotFound
+		}
+		return nil, err
 	}
 
-	if !retval {
-		return nil, len(iter.Value()), nil
-	}
-	val := iter.Value()
-	cpy := make([]byte, len(val))
-	copy(cpy, val)
-	return cpy, len(val), nil
+	return val, closer.Close()
 }
 
 // Get reads a key from the datastore.
-func (d *Datastore) Get(ctx context.Context, key ds.Key) (value []byte, err error) {
-	val, _, err := d.get(key.Bytes(), true)
-	return val, err
+func (d *Datastore) Get(_ context.Context, key ds.Key) (value []byte, err error) {
+	return d.get(key.Bytes())
 }
 
 // Has can be used to check whether a key is stored in the datastore. Has()
@@ -112,24 +101,24 @@ func (d *Datastore) Get(ctx context.Context, key ds.Key) (value []byte, err erro
 // keys will also read the values. Avoid using Has() if you later expect to
 // read the key anyways. Has() calls for non-existing keys should take
 // advantage of bloom filters and avoid reads.
-func (d *Datastore) Has(ctx context.Context, key ds.Key) (exists bool, _ error) {
-	_, _, err := d.get(key.Bytes(), false)
-	switch err {
-	case ds.ErrNotFound:
+func (d *Datastore) Has(_ context.Context, key ds.Key) (exists bool, _ error) {
+	_, err := d.get(key.Bytes())
+	switch {
+	case errors.Is(err, ds.ErrNotFound):
 		return false, nil
-	case nil:
+	case err == nil:
 		return true, nil
 	default:
 		return false, err
 	}
 }
 
-func (d *Datastore) GetSize(ctx context.Context, key ds.Key) (size int, _ error) {
-	_, size, err := d.get(key.Bytes(), false)
+func (d *Datastore) GetSize(_ context.Context, key ds.Key) (int, error) {
+	val, err := d.get(key.Bytes())
 	if err != nil {
 		return -1, err
 	}
-	return size, nil
+	return len(val), nil
 }
 
 func (d *Datastore) Query(ctx context.Context, q query.Query) (query.Results, error) {
@@ -173,7 +162,10 @@ func (d *Datastore) Query(ctx context.Context, q query.Query) (query.Results, er
 		}(),
 	}
 
-	iter := d.db.NewIter(opts)
+	iter, err := d.db.NewIterWithContext(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 
 	var move func() bool
 	switch l := len(orders); l {
@@ -227,20 +219,30 @@ func (d *Datastore) Query(ctx context.Context, q query.Query) (query.Results, er
 		doFilter = true
 	}
 
-	createEntry := func() query.Entry {
+	createEntry := func() (query.Entry, error) {
 		// iter.Key and iter.Value may change on the next call to iter.Next.
 		// string conversion takes a copy
 		entry := query.Entry{Key: string(iter.Key())}
 		if !keysOnly {
 			// take a copy.
-			cpy := make([]byte, len(iter.Value()))
-			copy(cpy, iter.Value())
+			val, err := iter.ValueAndErr()
+			if err != nil {
+				return query.Entry{}, err
+			}
+
+			cpy := make([]byte, len(val))
+			copy(cpy, val)
 			entry.Value = cpy
 		}
 		if returnSizes {
-			entry.Size = len(iter.Value())
+			val, err := iter.ValueAndErr()
+			if err != nil {
+				return query.Entry{}, err
+			}
+
+			entry.Size = len(val)
 		}
-		return entry
+		return entry, nil
 	}
 
 	d.wg.Add(1)
@@ -283,7 +285,11 @@ func (d *Datastore) Query(ctx context.Context, q query.Query) (query.Results, er
 			if err := iter.Error(); err != nil {
 				sendOrInterrupt(query.Result{Error: err})
 			}
-			if doFilter && !filterFn(createEntry()) {
+			e, err := createEntry()
+			if err != nil {
+				continue
+			}
+			if doFilter && !filterFn(e) {
 				// if we have a filter, and this entry doesn't match it,
 				// don't count it.
 				continue
@@ -296,7 +302,10 @@ func (d *Datastore) Query(ctx context.Context, q query.Query) (query.Results, er
 			if err := iter.Error(); err != nil {
 				sendOrInterrupt(query.Result{Error: err})
 			}
-			entry := createEntry()
+			entry, err := createEntry()
+			if err != nil {
+				continue
+			}
 			if doFilter && !filterFn(entry) {
 				// if we have a filter, and this entry doesn't match it,
 				// do not sendOrInterrupt it.
