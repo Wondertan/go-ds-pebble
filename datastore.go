@@ -87,8 +87,9 @@ func (d *Datastore) get(key []byte) ([]byte, error) {
 		}
 		return nil, err
 	}
-
-	return val, closer.Close()
+	cp := make([]byte, len(val)) // TODO(@Wondertan): reuse buffers
+	copy(cp, val)
+	return cp, closer.Close()
 }
 
 // Get reads a key from the datastore.
